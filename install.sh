@@ -47,6 +47,19 @@ EOF
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     launchctl bootstrap "gui/$(id -u)" "$DEST"
     echo "loaded $LABEL"
+
+    # Bootstrap: ensure ~/Downloads exists and pre-create category folders so
+    # the user sees a fully organized layout immediately, without waiting for
+    # the first file event to fire the launchd job.
+    if [ ! -e "$HOME/Downloads" ]; then
+      mkdir -m 0700 -- "$HOME/Downloads"
+      echo "created $HOME/Downloads"
+    fi
+    if [ -d "$HOME/Downloads" ] && [ ! -L "$HOME/Downloads" ]; then
+      "$BIN" || true
+      echo "bootstrapped category folders in ~/Downloads"
+    fi
+
     echo
     echo "on first run macOS may prompt for access to your Downloads folder."
     echo "grant it in System Settings -> Privacy & Security -> Files and Folders."
