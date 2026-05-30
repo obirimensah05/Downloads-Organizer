@@ -13,14 +13,38 @@
 #
 # Never deletes. Uses `mv -n` exclusively; on collision, renames with a
 # `dup_<epoch>_` prefix.
+#
+# How it runs:
+#   This script is the worker. It is invoked (via the OrganizeDownloads.app
+#   AppleScript wrapper) by the launchd agent `local.organize-downloads`, which
+#   watches `~/Downloads` for file-system changes (WatchPaths) and also sweeps
+#   every 5 minutes (StartInterval) as a fallback. See install.sh and
+#   com.organize-downloads.plist.template for how that agent is installed and
+#   loaded. It is also safe to run by hand as a one-off sweep.
+#
+# Exit policy:
+#   Every failure path exits 0 ("nothing to do" rather than "error"). This is
+#   deliberate: launchd would otherwise treat a non-zero exit as a crash and
+#   could throttle or flap the agent. The job is best-effort and idempotent.
+#
+# Note: rule definitions live inline below (the `move <Category> <globs>`
+# block). The repo also ships a rules.conf describing a config-file format, but
+# THIS script does not read it — see rules.conf for details.
 
+# Fail on use of unset variables; do NOT abort on individual command errors
+# (we want a single failing mv to skip one file, not kill the whole sweep).
 set -u
+# Restrict permissions on everything we create (category dirs, the lock dir):
+# owner-only (0700 for dirs). Keeps a multi-user Mac from leaking file lists.
 umask 077
 
-DL="$HOME/Downloads"
-LOCK_DIR="$HOME/Library/Caches/organize-downloads.lock"
-UID_ME="$(id -u)"
+DL="$HOME/Downloads"                                    # the folder we organize
+LOCK_DIR="$HOME/Library/Caches/organize-downloads.lock" # single-instance lock
+UID_ME="$(id -u)"                                       # current user's numeric UID
 
+# log MESSAGE...
+# Emit a timestamped, PID-tagged line to stdout. launchd redirects stdout to
+# ~/Library/Logs/organize-downloads.log (and stderr to .err) per the plist.
 log() {
   printf '%s [organize-downloads %d] %s\n' \
     "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$$" "$*"
@@ -38,9 +62,14 @@ if [ "$(stat -f %u -- "$DL" 2>/dev/null)" != "$UID_ME" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Single-instance lock. mkdir is atomic on every POSIX FS.
+# Single-instance lock. mkdir is atomic on every POSIX FS, so a successful
+# mkdir of LOCK_DIR is the lock acquisition — only one process can win the race.
+# A rapid burst of download events can fire launchd repeatedly; the lock keeps
+# concurrent sweeps from fighting over the same files.
 mkdir -p "$(dirname -- "$LOCK_DIR")" 2>/dev/null || true
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  # Lock already held. Treat a lock older than 600s as stale (a previous run
+  # was killed before its EXIT trap could clean up) and forcibly reclaim it.
   lock_mtime="$(stat -f %m -- "$LOCK_DIR" 2>/dev/null || echo 0)"
   if [ "$(( $(date +%s) - lock_mtime ))" -gt 600 ]; then
     rmdir "$LOCK_DIR" 2>/dev/null || true
@@ -50,15 +79,22 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     exit 0
   fi
 fi
+# Release the lock on any exit (normal, error, or signal).
 trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
 cd -- "$DL" || { log "abort: cd $DL failed"; exit 0; }
 
 # ---------------------------------------------------------------------------
+# Category subfolders, all living directly under ~/Downloads. Each is both a
+# move destination AND "protected" — a category folder is never itself swept
+# into Folders/ (see is_protected). To add a category: append it here and add a
+# matching `move <Category> <globs>` line further down.
 CATEGORIES=(Images Videos Spreadsheets Documents Archives PDFs HTML Calendar \
             Folders Audio Installers Code Design Fonts Ebooks WhatsApp Subtitles)
 PROTECTED_DIRS=("${CATEGORIES[@]}")
 
+# Pre-create each category folder (owner-only). A category that already exists
+# as a symlink is left alone and flagged — we refuse to write through symlinks.
 for c in "${CATEGORIES[@]}"; do
   if [ -L "$c" ]; then
     log "skip: $c is a symlink — refusing to use it (remove manually)"
@@ -69,6 +105,10 @@ for c in "${CATEGORIES[@]}"; do
   fi
 done
 
+# dest_ok DIR
+# True only if DIR is a safe move target: a real directory (not a symlink) that
+# is owned by the current user. Guards against a planted symlink redirecting
+# moves outside ~/Downloads, or a category dir owned by someone else.
 dest_ok() {
   local d="$1"
   [ -L "$d" ] && return 1
@@ -77,6 +117,9 @@ dest_ok() {
   return 0
 }
 
+# is_protected NAME
+# True if NAME is one of our category folders. Used to keep the stray-folder
+# sweep from moving a category (e.g. Images/) into Folders/.
 is_protected() {
   local name="$1"
   for p in "${PROTECTED_DIRS[@]}"; do
@@ -86,6 +129,17 @@ is_protected() {
 }
 
 # ---------------------------------------------------------------------------
+# move DEST FILE...
+# Move each FILE into category folder DEST (relative to ~/Downloads). FILE args
+# are the result of glob expansion at the call site, so they are plain filenames
+# in the current directory. Skips:
+#   - a non-existent arg (an unmatched glob left literal — though nullglob below
+#     usually prevents this),
+#   - symlinks (defensively, never followed),
+#   - anything that isn't a regular file,
+#   - in-progress downloads (.crdownload/.part/.download/.tmp) and dotfiles.
+# Uses `mv -n` (no-clobber); on a name collision in DEST, the file is renamed
+# with a `dup_<epoch>_` prefix so nothing is ever overwritten or deleted.
 move() {
   local dest="$1"; shift
   if ! dest_ok "$dest"; then
@@ -109,8 +163,15 @@ move() {
   done
 }
 
+# Make unmatched globs expand to nothing rather than to the literal pattern, so
+# `move Images *.png` with no PNGs present passes zero args instead of "*.png".
+# (bash uses `shopt -s nullglob`; the zsh fallback uses `setopt NULL_GLOB`.)
 shopt -s nullglob 2>/dev/null || setopt NULL_GLOB 2>/dev/null
 
+# --- Rules: each line maps a glob set to a category. First-listed wins for a
+# given file because once moved it no longer matches later patterns. The
+# WhatsApp prefix rule runs first so "WhatsApp Image ....jpg" lands in WhatsApp/
+# rather than Images/.
 move WhatsApp     WhatsApp\ *
 
 move Images       *.png *.jpg *.jpeg *.webp *.gif *.heic *.PNG *.JPG *.JPEG *.WEBP *.GIF *.HEIC
@@ -130,7 +191,9 @@ move HTML         *.html *.htm
 move Calendar     *.ics
 
 # ---------------------------------------------------------------------------
-# Move any other top-level folder into Folders/, except protected ones.
+# Stray-folder sweep: move any other top-level directory in ~/Downloads into
+# Folders/, except the protected category folders themselves. Directory
+# symlinks are skipped (never followed).
 if dest_ok "Folders"; then
   for d in */; do
     name="${d%/}"
@@ -138,6 +201,8 @@ if dest_ok "Folders"; then
     [ -L "$name" ] && { log "skip dir symlink: $name"; continue; }
     mtime="$(stat -f %m -- "$name" 2>/dev/null || echo 0)"
     [ "$mtime" -gt 0 ] || continue
+    # Grace period: don't grab a folder modified in the last 5s — it may still
+    # be mid-extraction (e.g. an unzipping archive) and not yet complete.
     if [ "$(( $(date +%s) - mtime ))" -lt 5 ]; then
       continue
     fi
